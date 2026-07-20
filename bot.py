@@ -11,7 +11,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ============================================
 # CONFIGURAÇÃO DO AMBIENTE
 # ============================================
-TELEGRAM_TOKEN = os.environ.get("8900982200:AAF6043fYJm81KphTsgNFwSLRewh-53owyA")
+TELEGRAM_TOKEN = "8900982200:AAF6gjwDxyNGOK3smhg4Lr2h5XeHqeHCQPI"
 GROQ_KEY = os.environ.get("GROQ_KEY")
 ADMIN_ID = os.environ.get("ADMIN_ID", "8407367527")  
 
