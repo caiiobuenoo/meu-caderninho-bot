@@ -145,7 +145,6 @@ EXTRACTION_PROMPT = """<system_prompt>
     Você deve responder ÚNICA E EXCLUSIVAMENTE com um objeto JSON válido, sem NENHUM texto antes ou depois. NUNCA use blocos de marcação como ```json. Apenas inicie com { e termine com }.
     O JSON deve seguir EXATAMENTE esta estrutura:
     {
-      "pensamento_interno": "String curta.",
       "unidade": "String ou null.",
       "custo": "Float ou null.",
       "horas": "Float ou null.",
@@ -168,18 +167,21 @@ EXTRACTION_PROMPT = """<system_prompt>
 # CONTROLE DE TAXA DA GROQ (evita 429)
 # ============================================
 ultimo_tempo_groq = 0
-MIN_INTERVALO_GROQ = 2.5  # segundos entre chamadas
+MIN_INTERVALO_GROQ = 3.0  # segundos entre chamadas (máximo ~20/min, seguro para plano gratuito)
+groq_bloqueado_ate = 0     # timestamp até o qual a Groq está bloqueada
 
-def chamar_groq_com_retry(messages, headers, max_retries=3):
-    global ultimo_tempo_groq
+def chamar_groq_com_retry(messages, headers):
+    global ultimo_tempo_groq, groq_bloqueado_ate
 
-    # Garantir intervalo mínimo entre requisições
+    # Se o Groq está temporariamente bloqueado, não tenta
+    if time.time() < groq_bloqueado_ate:
+        raise Exception("Groq temporariamente indisponível. Aguarde alguns minutos.")
+
+    # Garantir intervalo mínimo
     agora = time.time()
     diff = agora - ultimo_tempo_groq
     if diff < MIN_INTERVALO_GROQ:
-        espera = MIN_INTERVALO_GROQ - diff
-        logger.info(f"Aguardando {espera:.1f}s para respeitar limite da Groq...")
-        time.sleep(espera)
+        time.sleep(MIN_INTERVALO_GROQ - diff)
 
     payload = {
         "model": "llama-3.3-70b-versatile",
@@ -189,17 +191,17 @@ def chamar_groq_com_retry(messages, headers, max_retries=3):
         "response_format": {"type": "json_object"},
     }
 
-    for tentativa in range(max_retries):
-        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
-        if response.status_code == 429:
-            espera = 5 * (tentativa + 1)  # 5, 10, 15 segundos
-            logger.warning(f"Limite de taxa da Groq atingido. Tentativa {tentativa+1}/{max_retries}. Aguardando {espera}s...")
-            time.sleep(espera)
-            continue
-        ultimo_tempo_groq = time.time()
-        response.raise_for_status()
-        return response
-    raise Exception("Limite de requisições da Groq excedido. Aguarde um momento e tente novamente.")
+    response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+    
+    if response.status_code == 429:
+        # Bloquear novas chamadas por 1 minuto
+        groq_bloqueado_ate = time.time() + 60
+        logger.warning("Limite da Groq excedido. Bloqueando novas chamadas por 1 minuto.")
+        raise Exception("Limite de requisições excedido. Tente novamente em 1 minuto.")
+    
+    ultimo_tempo_groq = time.time()
+    response.raise_for_status()
+    return response
 
 # ============================================
 # COMANDOS
@@ -235,7 +237,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 # ============================================
-# EXTRAÇÃO
+# EXTRAÇÃO (com fallback para quando a Groq falha)
 # ============================================
 async def extrair_dados(user_id: str) -> dict:
     messages = [{"role": "system", "content": EXTRACTION_PROMPT}] + user_histories[user_id]
@@ -247,6 +249,34 @@ async def extrair_dados(user_id: str) -> dict:
     if content.startswith("```"):
         content = content.strip("`").removeprefix("json").strip()
     return json.loads(content)
+
+def gerar_resposta_fallback(user_msg: str, user_id: str) -> str:
+    """Resposta amigável quando a IA está fora do ar."""
+    msg_lower = user_msg.lower()
+    
+    # Se o usuário quer explicação e temos estado salvo
+    if any(p in msg_lower for p in ["por que", "porque", "explica", "como você calculou"]) and user_id in user_state:
+        resultado = user_state[user_id]["resultado"]
+        return (
+            f"📝 *Como cheguei nesse valor:*\n"
+            f"Custo dos materiais: R${resultado['custo']:.2f}\n"
+            f"Margem ({int(resultado['margem_pct']*100)}%): R${resultado['margem_valor']:.2f}\n"
+            f"Seu tempo: R${resultado['custo_tempo']:.2f}\n\n"
+            f"💰 *Preço Seguro* = R${resultado['preco_seguro']:.2f}"
+        )
+    
+    # Se escolheu um caminho e temos estado
+    if user_id in user_state:
+        return "👍 Entendi sua escolha! Mas estou com muita procura agora, me dê um minuto para processar."
+    
+    # Resposta genérica amigável
+    return (
+        "😅 *Poxa, estou com muitas pessoas usando o bot agora!*\n\n"
+        "Minha capacidade de pensar (a inteligência artificial) atingiu o limite do plano gratuito. "
+        "Mas calma, daqui a pouquinho eu volto ao normal.\n\n"
+        "Enquanto isso, você pode me falar *quanto custa* seu produto e *quantas horas* leva para fazer, "
+        "que eu já vou anotando aqui. Quando voltar, calculo rapidinho!"
+    )
 
 # ============================================
 # MENSAGENS
@@ -268,17 +298,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_histories[user_id] = []
     user_histories[user_id].append({"role": "user", "content": user_msg})
 
+    # Tentar extrair com IA
     try:
         dados = await extrair_dados(user_id)
     except Exception as e:
         logger.error(f"Erro na extração: {e}")
-        # Se for erro 429, dá uma dica mais amigável
-        if "429" in str(e):
-            reply = "🕒 Poxa, muita gente usando aqui! Me dá um minuto e tenta de novo, por favor."
-        else:
-            reply = "Deu ruim na minha conexão. Tenta de novo."
+        # Usar resposta fallback (não depende da IA)
+        reply = gerar_resposta_fallback(user_msg, user_id)
         user_histories[user_id].append({"role": "assistant", "content": reply})
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, parse_mode="Markdown")
         return
 
     msg_lower = user_msg.lower()
