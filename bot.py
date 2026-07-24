@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import time
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -191,6 +192,28 @@ EXTRACTION_PROMPT = """<system_prompt>
 </system_prompt>"""
 
 # ============================================
+# CHAMADA À GROQ COM RETRY PARA EVITAR 429
+# ============================================
+def chamar_groq_com_retry(messages, headers, max_retries=3):
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": messages,
+        "max_tokens": 400,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    for tentativa in range(max_retries):
+        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        if response.status_code == 429:
+            espera = 2 ** tentativa  # 1, 2, 4 segundos
+            logger.warning(f"Limite de taxa da Groq atingido. Tentando novamente em {espera}s...")
+            time.sleep(espera)
+            continue
+        response.raise_for_status()
+        return response
+    response.raise_for_status()
+
+# ============================================
 # COMANDOS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,15 +255,7 @@ async def extrair_dados(user_id: str) -> dict:
         messages = [messages[0]] + messages[-10:]
 
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": messages,
-        "max_tokens": 400,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
-    response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
-    response.raise_for_status()
+    response = chamar_groq_com_retry(messages, headers)
     content = response.json()["choices"][0]["message"]["content"].strip()
     # Defensivo: alguns modelos ainda embrulham em ```json mesmo em JSON mode
     if content.startswith("```"):
@@ -346,6 +361,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_histories[user_id].append({"role": "assistant", "content": reply})
     await update.message.reply_text(reply, parse_mode="Markdown")
+
 # ============================================
 # INICIALIZAÇÃO (sem asyncio.run, compatível com Python 3.14+)
 # ============================================
