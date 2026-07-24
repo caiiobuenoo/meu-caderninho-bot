@@ -1,7 +1,6 @@
 import os
 import logging
 import json
-import asyncio
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -323,9 +322,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 # ============================================
-# MAIN
+# INICIALIZAÇÃO (sem asyncio.run, compatível com Python 3.14+)
 # ============================================
-async def main():
+if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN não configurado nas variáveis de ambiente.")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -333,7 +332,4 @@ async def main():
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot rodando 24/7 no Render...")
-    await app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    app.run_polling(drop_pending_updates=True)
