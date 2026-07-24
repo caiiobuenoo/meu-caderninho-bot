@@ -237,8 +237,7 @@ async def extrair_dados(user_id: str) -> dict:
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
-    response = requests.post("[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)", headers=headers, json=payload)
-    response.raise_for_status()
+response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)    response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"].strip()
     # Defensivo: alguns modelos ainda embrulham em ```json mesmo em JSON mode
     if content.startswith("```"):
