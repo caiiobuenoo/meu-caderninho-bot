@@ -276,6 +276,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
+    msg_lower = user_msg.lower()
+
+    # Caso -2: usuário quer explicação do último cálculo
+    if any(p in msg_lower for p in ["por que", "porque", "explica", "como você calculou", "como chegou"]) and user_id in user_state:
+        resultado = user_state[user_id]["resultado"]
+        expl = (
+            f"📝 *Como cheguei nesse valor:*\n"
+            f"Custo dos materiais: R${resultado['custo']:.2f}\n"
+            f"Margem ({int(resultado['margem_pct']*100)}%): R${resultado['margem_valor']:.2f}\n"
+        )
+        if resultado['custo_tempo']:
+            expl += f"Seu tempo ({resultado['horas']:g}h): R${resultado['custo_tempo']:.2f}\n"
+        expl += f"\n💰 *Preço Seguro* = R${resultado['preco_seguro']:.2f}\n"
+        expl += f"⚡ *Preço Agressivo* (75% do Seguro) = R${resultado['preco_agressivo']:.2f}\n"
+        expl += f"💎 *Valor Agregado* (135% do Seguro) = R${resultado['preco_valor_agregado']:.2f}"
+        user_histories[user_id].append({"role": "assistant", "content": expl})
+        await update.message.reply_text(expl, parse_mode="Markdown")
+        return
+
+    # Caso -1: usuário pede um novo produto -> limpa estado
+    if any(p in msg_lower for p in ["outro", "novo", "mais produto", "precificar outro", "ajustar"]) and user_id in user_state:
+        user_state.pop(user_id, None)
+        # Continua o fluxo normal (cai no Caso 3 e pergunta o que precificar)
+
     # Caso 0: usuário escolheu um caminho de preço
     caminho = dados.get("caminho_escolhido")
     if caminho and user_id in user_state:
@@ -289,15 +313,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if preco_escolhido is not None:
             reply = (
                 f"Boa escolha! O preço *{caminho.replace('_', ' ').title()}* ficou em *R${preco_escolhido:.2f}*.\n\n"
-                f"Quer precificar outro produto/serviço ou ajustar algum número?"
+                f"Se quiser saber como cheguei nesse número, é só perguntar \"como você calculou?\".\n"
+                f"Ou então, quer precificar outro produto/serviço?"
             )
+            user_state[user_id]["ultima_escolha"] = caminho
         else:
             reply = "Não entendi qual caminho você escolheu. Pode repetir? (Seguro, Agressivo ou Valor Agregado)"
         user_histories[user_id].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply, parse_mode="Markdown")
         return
 
-    # Caso 1: já temos custo + horas (novos ou repetidos) -> calcula de novo, sempre
+    # Caso 1: já temos custo + horas -> calcula
     if dados.get("ready") and dados.get("custo") is not None and dados.get("horas") is not None:
         resultado = calcular_preco(
             custo=float(dados["custo"]),
@@ -310,17 +336,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             reply = formatar_resposta_preco(dados, resultado)
 
-    # Caso 2: pediu detalhes mas os números saíram da janela de histórico -> reusa o último cálculo salvo
+    # Caso 2: pediu detalhes mas sem números -> reusa último cálculo
     elif dados.get("quer_detalhes") and user_id in user_state:
         reply = formatar_detalhes(user_state[user_id]["resultado"])
 
-    # Caso 3: ainda faltam dados -> só pergunta, nunca calcula
+    # Caso 3: faltam dados -> pergunta
     else:
         reply = dados.get("proxima_pergunta") or "Me conta mais sobre o que você quer precificar?"
 
     user_histories[user_id].append({"role": "assistant", "content": reply})
     await update.message.reply_text(reply, parse_mode="Markdown")
-
 # ============================================
 # INICIALIZAÇÃO (sem asyncio.run, compatível com Python 3.14+)
 # ============================================
