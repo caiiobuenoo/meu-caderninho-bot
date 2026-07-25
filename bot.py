@@ -359,7 +359,7 @@ def gerar_resposta_fallback(user_id: str) -> str:
     return FALLBACKS.get(lang, FALLBACKS['en'])
 
 # ============================================
-# MENSAGENS (CORRIGIDO: detecção de idioma a cada mensagem)
+# MENSAGENS (com correção de saudação)
 # ============================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -367,23 +367,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_msg:
         return
 
-    # DETECTA IDIOMA A CADA MENSAGEM (não apenas na primeira)
+    # Detectar idioma a cada mensagem
     try:
         detected = detect(user_msg)
         if detected in ['pt', 'en', 'es']:
             user_language[user_id] = detected
         else:
-            # Se detectou outro idioma, mantém o último conhecido ou 'en'
-            if user_id not in user_language:
-                user_language[user_id] = 'en'
+            user_language[user_id] = 'en'
     except:
-        # Em caso de erro, mantém o idioma anterior ou fallback 'pt'
-        if user_id not in user_language:
-            user_language[user_id] = 'pt'
+        user_language[user_id] = 'pt'
 
     lang = user_language[user_id]
-    moeda = MOEDAS.get(lang, 'R$')
 
+    # --- CORREÇÃO: SAUDAÇÕES ---
+    msg_lower = user_msg.lower().strip()
+    saudacoes_pt = ["oi", "olá", "ola", "e aí", "eai", "opa", "tudo bem", "bom dia", "boa tarde", "boa noite", "oie", "oiee"]
+    saudacoes_en = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "how are you", "what's up", "yo"]
+    saudacoes_es = ["hola", "buenos días", "buenas tardes", "buenas noches", "qué tal", "cómo estás", "hey", "holi"]
+
+    # Se for uma saudação exata (ou lista combinada)
+    if any(msg_lower == s for s in saudacoes_pt + saudacoes_en + saudacoes_es):
+        # Reseta o estado do usuário
+        user_histories[user_id] = []
+        user_state.pop(user_id, None)
+        # Responde no idioma detectado
+        if lang == 'pt':
+            reply = "Oi! Sou o Meu Caderninho. Me fala o que você quer precificar."
+        elif lang == 'en':
+            reply = "Hi! I'm Pricing Pal. Tell me what you want to price."
+        else:  # es
+            reply = "¡Hola! Soy Mi Cuaderno. Dime qué quieres precificar."
+        await update.message.reply_text(reply)
+        return
+
+    # Continuação do fluxo normal (cálculo, extração, etc.)
     data = load_user_data()
     if user_id not in data:
         data[user_id] = {"first_seen": datetime.now().isoformat(), "last_seen": None, "messages": 0}
@@ -395,7 +412,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_histories[user_id] = []
     user_histories[user_id].append({"role": "user", "content": user_msg})
 
-    # Tentar extrair com IA
+    moeda = MOEDAS.get(lang, 'R$')
+
     try:
         dados = await extrair_dados(user_id)
     except Exception as e:
