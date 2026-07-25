@@ -7,6 +7,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from langdetect import detect
+from langdetect import DetectorFactory
+DetectorFactory.seed = 0
 
 # ============================================
 # CONFIGURAÇÃO DO AMBIENTE
