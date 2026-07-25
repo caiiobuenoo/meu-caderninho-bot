@@ -102,7 +102,7 @@ def calcular_preco(custo: float, horas: float = None, margem_pct: float = None, 
         "preco_valor_agregado": round(preco_valor_agregado, 2),
     }
 
-MOEDAS = {'pt': 'R$', 'en': '$', 'es': '€'}
+MOEDAS = {'pt': 'R$', 'en': '$', 'es': '€'}  # Ajuste 'es' conforme seu público (€, MX$, USD)
 
 def formatar_resposta_preco(dados: dict, resultado: dict, lang: str = 'pt') -> str:
     moeda = MOEDAS.get(lang, 'R$')
@@ -359,7 +359,7 @@ def gerar_resposta_fallback(user_id: str) -> str:
     return FALLBACKS.get(lang, FALLBACKS['en'])
 
 # ============================================
-# MENSAGENS (com correção de saudação)
+# MENSAGENS (com correção robusta de saudações)
 # ============================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -367,40 +367,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_msg:
         return
 
-    # Detectar idioma a cada mensagem
+    msg_lower = user_msg.strip().lower()
+
+    # --- SAUDAÇÕES EXPLÍCITAS (idioma definido pela saudação) ---
+    saudacoes = {
+        # português
+        "oi": "pt", "olá": "pt", "ola": "pt", "oie": "pt", "oiee": "pt", "e aí": "pt", "eai": "pt",
+        "opa": "pt", "tudo bem": "pt", "bom dia": "pt", "boa tarde": "pt", "boa noite": "pt",
+        # inglês
+        "hi": "en", "hello": "en", "hey": "en", "good morning": "en", "good afternoon": "en",
+        "good evening": "en", "how are you": "en", "what's up": "en", "yo": "en",
+        # espanhol
+        "hola": "es", "holi": "es", "buenos días": "es", "buenas tardes": "es",
+        "buenas noches": "es", "qué tal": "es", "cómo estás": "es",
+    }
+
+    if msg_lower in saudacoes:
+        lang = saudacoes[msg_lower]
+        user_language[user_id] = lang
+        user_histories[user_id] = []
+        user_state.pop(user_id, None)
+
+        boas_vindas = {
+            "pt": "Oi! Sou o Meu Caderninho. Me fala o que você quer precificar.",
+            "en": "Hi! I'm Pricing Pal. Tell me what you want to price.",
+            "es": "¡Hola! Soy Mi Cuaderno. Dime qué quieres precificar.",
+        }
+        await update.message.reply_text(boas_vindas[lang])
+        return
+
+    # --- DETECÇÃO NORMAL (para frases que não são saudação) ---
     try:
         detected = detect(user_msg)
         if detected in ['pt', 'en', 'es']:
             user_language[user_id] = detected
         else:
-            user_language[user_id] = 'en'
+            # Se detectou outro idioma, mantém o último conhecido ou 'en'
+            if user_id not in user_language:
+                user_language[user_id] = 'en'
     except:
-        user_language[user_id] = 'pt'
+        if user_id not in user_language:
+            user_language[user_id] = 'pt'
 
     lang = user_language[user_id]
+    moeda = MOEDAS.get(lang, 'R$')
 
-    # --- CORREÇÃO: SAUDAÇÕES ---
-    msg_lower = user_msg.lower().strip()
-    saudacoes_pt = ["oi", "olá", "ola", "e aí", "eai", "opa", "tudo bem", "bom dia", "boa tarde", "boa noite", "oie", "oiee"]
-    saudacoes_en = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "how are you", "what's up", "yo"]
-    saudacoes_es = ["hola", "buenos días", "buenas tardes", "buenas noches", "qué tal", "cómo estás", "hey", "holi"]
-
-    # Se for uma saudação exata (ou lista combinada)
-    if any(msg_lower == s for s in saudacoes_pt + saudacoes_en + saudacoes_es):
-        # Reseta o estado do usuário
-        user_histories[user_id] = []
-        user_state.pop(user_id, None)
-        # Responde no idioma detectado
-        if lang == 'pt':
-            reply = "Oi! Sou o Meu Caderninho. Me fala o que você quer precificar."
-        elif lang == 'en':
-            reply = "Hi! I'm Pricing Pal. Tell me what you want to price."
-        else:  # es
-            reply = "¡Hola! Soy Mi Cuaderno. Dime qué quieres precificar."
-        await update.message.reply_text(reply)
-        return
-
-    # Continuação do fluxo normal (cálculo, extração, etc.)
+    # --- FLUXO NORMAL ---
     data = load_user_data()
     if user_id not in data:
         data[user_id] = {"first_seen": datetime.now().isoformat(), "last_seen": None, "messages": 0}
@@ -412,8 +424,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_histories[user_id] = []
     user_histories[user_id].append({"role": "user", "content": user_msg})
 
-    moeda = MOEDAS.get(lang, 'R$')
-
     try:
         dados = await extrair_dados(user_id)
     except Exception as e:
@@ -422,8 +432,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_histories[user_id].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply, parse_mode="Markdown")
         return
-
-    msg_lower = user_msg.lower()
 
     # Explicação do último cálculo
     if any(p in msg_lower for p in ["por que", "porque", "explica", "como você calculou", "como chegou",
