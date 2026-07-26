@@ -389,6 +389,19 @@ No uses JSON, solo el texto final."""
 }
 
 # ============================================
+# PROMPT PARA ASSISTENTE GERAL (PERGUNTAS GERAIS)
+# ============================================
+GERAL_PROMPT = """Você é um assistente amigável e direto. Responda à pergunta do usuário em poucas frases (máximo 3 parágrafos curtos). 
+Se for uma pergunta aleatória, responda com informação útil e depois redirecione para a precificação. 
+Sempre finalize perguntando se o usuário quer precificar algo ou se precisa de ajuda com preços.
+
+Exemplo:
+Usuário: Qual a capital da França?
+Resposta: "Paris é a capital da França! 🇫🇷 
+Agora, me conta: você tem algum produto ou serviço para precificar? Posso te dar uma mão!"
+"""
+
+# ============================================
 # FUNÇÕES AUXILIARES
 # ============================================
 def extrair_json(resposta: str) -> dict:
@@ -595,6 +608,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_histories[user_id] = []
     user_histories[user_id].append({"role": "user", "content": user_msg})
 
+    # --- PERGUNTAS GERAIS (antes da extração) ---
+    palavras_chave_gerais = ["qual", "quem", "quando", "onde", "como", "por que", "para que", "oque", "o que"]
+    if any(p in msg_lower for p in palavras_chave_gerais):
+        try:
+            headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+            messages = [{"role": "system", "content": GERAL_PROMPT}, {"role": "user", "content": user_msg}]
+            response = await chamar_groq_async(messages, headers, temperature=0.7)
+            reply = response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error(f"Erro no assistente geral: {e}")
+            reply = "Desculpe, não consegui responder agora. Mas me fala o que você quer precificar!"
+        
+        await update.message.reply_text(reply)
+        return
+
     # --- EXTRAÇÃO ---
     try:
         dados = await extrair_dados(user_id)
@@ -713,9 +741,6 @@ async def iniciar_consultoria(update: Update, user_id: str, lang: str):
         'es': "¡Ahora déjame ayudarte a vender mejor! 👇\n¿Quién suele comprar tu producto? (ej.: fiestas de cumpleaños, happy hour, empresas...)"
     }
     pergunta = perguntas.get(lang, perguntas['pt'])
-    # Garante que user_state[user_id] existe
-    if user_id not in user_state:
-        user_state[user_id] = {}
     user_state[user_id]["stage"] = "awaiting_audience"
     await atualizar_dados_usuario(user_id, state=user_state[user_id])
     await update.message.reply_text(pergunta)
