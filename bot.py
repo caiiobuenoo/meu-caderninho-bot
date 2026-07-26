@@ -713,6 +713,9 @@ async def iniciar_consultoria(update: Update, user_id: str, lang: str):
         'es': "¡Ahora déjame ayudarte a vender mejor! 👇\n¿Quién suele comprar tu producto? (ej.: fiestas de cumpleaños, happy hour, empresas...)"
     }
     pergunta = perguntas.get(lang, perguntas['pt'])
+    # Garante que user_state[user_id] existe
+    if user_id not in user_state:
+        user_state[user_id] = {}
     user_state[user_id]["stage"] = "awaiting_audience"
     await atualizar_dados_usuario(user_id, state=user_state[user_id])
     await update.message.reply_text(pergunta)
