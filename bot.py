@@ -269,7 +269,7 @@ No uses JSON, solo el texto final."""
 # FUNÇÕES AUXILIARES
 # ============================================
 def extrair_json(resposta: str) -> dict:
-    """Tenta extrair um objeto JSON de uma string."""
+    """Tenta extrair um objeto JSON de uma string, com tratamento específico de erro."""
     inicio = resposta.find('{')
     fim = resposta.rfind('}')
     if inicio != -1 and fim != -1 and fim > inicio:
@@ -278,6 +278,7 @@ def extrair_json(resposta: str) -> dict:
             return json.loads(candidato)
         except json.JSONDecodeError:
             pass
+    # Última tentativa com a resposta inteira; se falhar, levanta exceção (capturada no handler)
     return json.loads(resposta)
 
 # ============================================
@@ -389,7 +390,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg_lower = user_msg.strip().lower()
 
-    # --- SAUDAÇÕES ---
+    # --- SAUDAÇÕES (força idioma) ---
     saudacoes = {
         "oi": "pt", "olá": "pt", "ola": "pt", "oie": "pt", "oiee": "pt", "e aí": "pt", "eai": "pt",
         "opa": "pt", "tudo bem": "pt", "bom dia": "pt", "boa tarde": "pt", "boa noite": "pt",
@@ -414,22 +415,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await atualizar_dados_usuario(user_id, language=lang, state=None)
         return
 
-    # --- DETECÇÃO DE IDIOMA ---
-    try:
-        detected = detect(user_msg)
-        if detected in ['pt', 'en', 'es']:
-            user_language[user_id] = detected
-        else:
-            if user_id not in user_language:
+    # --- DETECÇÃO DE IDIOMA COM PERSISTÊNCIA ---
+    if user_id not in user_language:
+        # Primeira mensagem: detecta e define
+        try:
+            detected = detect(user_msg)
+            if detected in ['pt', 'en', 'es']:
+                user_language[user_id] = detected
+            else:
                 user_language[user_id] = 'en'
-    except:
-        if user_id not in user_language:
+        except:
             user_language[user_id] = 'pt'
+    else:
+        # Já tem idioma: só atualiza se mensagem longa (≥4 palavras) ou contiver "?"
+        if len(user_msg.split()) >= 4 or "?" in user_msg:
+            try:
+                detected = detect(user_msg)
+                if detected in ['pt', 'en', 'es']:
+                    user_language[user_id] = detected
+            except:
+                pass
+        # Se curta, mantém o idioma atual
 
     lang = user_language[user_id]
     moeda = MOEDAS.get(lang, 'R$')
 
-    # --- ESTATÍSTICAS ---
+    # --- ESTATÍSTICAS E PERSISTÊNCIA ---
     data = await load_user_data()
     if user_id not in data:
         data[user_id] = {"first_seen": datetime.now().isoformat()}
@@ -441,6 +452,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_histories:
         user_histories[user_id] = []
     user_histories[user_id].append({"role": "user", "content": user_msg})
+
+    # --- CAPTURAR NOME DO USUÁRIO ---
+    padroes_nome = [
+        r'meu nome é\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)',
+        r'chamo\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)',
+        r'sou o\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)',
+        r'sou a\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)',
+        r'me chamo\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)',
+    ]
+    nome_encontrado = False
+    for padrao in padroes_nome:
+        match = re.search(padrao, user_msg, re.IGNORECASE)
+        if match:
+            nome = match.group(1)
+            if user_id not in user_state:
+                user_state[user_id] = {}
+            user_state[user_id]["nome"] = nome
+            await atualizar_dados_usuario(user_id, nome=nome)
+            saudacoes_nome = {
+                'pt': f"Olá {nome}! Agora, me conta: você tem algum produto para precificar?",
+                'en': f"Hello {nome}! Now, tell me: do you have a product to price?",
+                'es': f"¡Hola {nome}! Ahora, dime: ¿tienes algún producto para fijar precio?"
+            }
+            await update.message.reply_text(saudacoes_nome.get(lang, saudacoes_nome['pt']))
+            nome_encontrado = True
+            break
+    if nome_encontrado:
+        return
+
+    # --- PERGUNTA SOBRE O NOME ---
+    if any(p in msg_lower for p in ["qual meu nome", "meu nome", "quem sou eu"]):
+        nome = user_state.get(user_id, {}).get("nome")
+        if nome:
+            replies = {
+                'pt': f"Seu nome é {nome}!",
+                'en': f"Your name is {nome}!",
+                'es': f"¡Tu nombre es {nome}!"
+            }
+            reply = replies.get(lang, replies['pt'])
+        else:
+            replies = {
+                'pt': "Ainda não sei seu nome. Pode me dizer? (ex: 'meu nome é Caio')",
+                'en': "I don't know your name yet. Can you tell me? (e.g., 'my name is John')",
+                'es': "Aún no sé tu nombre. ¿Puedes decírmelo? (ej.: 'mi nombre es Carlos')"
+            }
+            reply = replies.get(lang, replies['pt'])
+        await update.message.reply_text(reply)
+        return
 
     # --- CONSULTORIA (estágio especial) ---
     if user_id in user_state and user_state[user_id].get("stage") == "awaiting_audience":
@@ -476,10 +535,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, parse_mode="Markdown")
         return
 
-    # Tentar interpretar a resposta como JSON de precificação
+    # Tentar interpretar como JSON de precificação
     try:
         dados = extrair_json(raw_reply)
-        # Se contém campos de precificação, processa
         if (dados.get("custo") is not None and 
             dados.get("horas") is not None and 
             dados.get("valor_hora") is not None):
@@ -507,12 +565,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply, parse_mode="Markdown")
             await atualizar_dados_usuario(user_id, state=user_state[user_id], language=lang)
 
-            # Se não pediu detalhes, iniciamos a consultoria
             if not dados.get("quer_detalhes"):
                 await iniciar_consultoria(update, user_id, lang)
             return
     except:
-        pass   # não era JSON válido, tratar como resposta normal
+        pass
 
     # Resposta normal (texto)
     user_histories[user_id].append({"role": "assistant", "content": raw_reply})
