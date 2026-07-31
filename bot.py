@@ -14,6 +14,10 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from langdetect import detect
 from langdetect import DetectorFactory
+import PyPDF2
+import pdfplumber
+from docx import Document
+
 DetectorFactory.seed = 0
 
 # ============================================
@@ -31,9 +35,8 @@ LOG_FILE = os.path.join(DATA_DIR, "meu_caderninho.log")
 # REGRAS DE PRECIFICAÇÃO
 # ============================================
 MARGEM_PADRAO = 0.50
-IMPOSTO_PADRAO_MEI = 0.03   # 3%
+IMPOSTO_PADRAO_MEI = 0.03
 
-# Taxas por canal de venda
 TAXA_CANAL = {
     "direto": 1.0,
     "ifood": 1.15,
@@ -41,7 +44,6 @@ TAXA_CANAL = {
     "lojas": 0.8
 }
 
-# Mapeamento idioma → país para inflação (World Bank code)
 IDIOMA_PAIS = {
     "pt": "BRA",
     "en": "USA",
@@ -81,7 +83,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# PERSISTÊNCIA COM TRAVA ASSÍNCRONA
+# PERSISTÊNCIA
 # ============================================
 file_lock = asyncio.Lock()
 
@@ -131,14 +133,101 @@ async def atualizar_dados_usuario(user_id: str, **kwargs):
     await save_user_data(data)
 
 # ============================================
-# CÁLCULO TRANSPARENTE
+# FUNÇÕES DE EXTRAÇÃO DE TEXTO (DOCUMENTOS)
 # ============================================
-def calcular_preco(
-    custo: float,
-    horas: float,
-    valor_hora: float,
-    margem_pct: float = MARGEM_PADRAO
-) -> dict:
+def extrair_texto_pdf(caminho):
+    try:
+        with pdfplumber.open(caminho) as pdf:
+            texto = ""
+            for page in pdf.pages:
+                texto += page.extract_text() or ""
+            return texto
+    except Exception as e:
+        logger.error(f"Erro com pdfplumber: {e}")
+        try:
+            with open(caminho, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                texto = ""
+                for page in reader.pages:
+                    texto += page.extract_text() or ""
+                return texto
+        except Exception as e2:
+            logger.error(f"Erro com PyPDF2: {e2}")
+            return ""
+
+def extrair_texto_docx(caminho):
+    try:
+        doc = Document(caminho)
+        return "\n".join([p.text for p in doc.paragraphs])
+    except Exception as e:
+        logger.error(f"Erro ao extrair .docx: {e}")
+        return ""
+
+def extrair_texto_arquivo(caminho):
+    if caminho.lower().endswith('.pdf'):
+        return extrair_texto_pdf(caminho)
+    elif caminho.lower().endswith('.docx'):
+        return extrair_texto_docx(caminho)
+    elif caminho.lower().endswith('.txt') or caminho.lower().endswith('.md'):
+        try:
+            with open(caminho, 'r', encoding='utf-8') as f:
+                return f.read()
+        except UnicodeDecodeError:
+            with open(caminho, 'r', encoding='latin-1') as f:
+                return f.read()
+    else:
+        return ""
+
+# ============================================
+# PROMPTS DE REVISÃO
+# ============================================
+PROMPT_REVISAO_PROPOSTA = """
+Você é um consultor de propostas comerciais. Analise o documento enviado pelo usuário e devolva uma revisão detalhada.
+
+Seu objetivo é identificar:
+1. Preço total e margem estimada (se houver dados).
+2. Custos identificados (materiais, mão de obra, taxas, etc.).
+3. Riscos (ex: prazo curto, preço abaixo do mercado, cláusulas abusivas).
+4. Documentos necessários que estão faltando (ex: certidão negativa, comprovante de residência, etc.).
+5. Checklist final com recomendações práticas para o usuário ajustar a proposta antes de enviar.
+
+Seja crítico, direto e útil. Use "você" e "na real". Nada de linguagem de coach.
+Formato de saída: use títulos curtos e listas.
+"""
+
+PROMPT_REVISAO_ORCAMENTO = """
+Você é um consultor de orçamentos. Analise o documento enviado e devolva uma análise completa.
+
+1. Liste todos os itens do orçamento com seus respectivos valores.
+2. Calcule o custo total e a margem estimada.
+3. Identifique itens que podem estar superfaturados ou subfaturados.
+4. Sugira ajustes para melhorar a competitividade.
+5. Indique documentos que devem ser anexados ao orçamento.
+6. Dê um veredito final: o orçamento está bom, precisa de ajustes ou está inconsistente?
+
+Seja prático e direto. Use "você" e "na real".
+"""
+
+PROMPT_REVISAO_EDITAL = """
+Você é um consultor de licitações. Analise o edital enviado pelo usuário e extraia as informações mais importantes.
+
+Extraia:
+1. Objeto da licitação (o que está sendo comprado/contratado).
+2. Valor estimado ou limite.
+3. Prazos: data de entrega das propostas, data da abertura.
+4. Exigências documentais (certidões, comprovantes, atestados).
+5. Critérios de desempate (ex: menor preço, maior desconto, etc.).
+6. Checklist completo com todos os documentos que o usuário precisa providenciar para participar.
+
+No final, dê uma recomendação: o edital é viável para o usuário? Quais são os principais riscos?
+
+Seja claro, direto e objetivo. Use "você" e "na real".
+"""
+
+# ============================================
+# CÁLCULO DE PREÇO
+# ============================================
+def calcular_preco(custo, horas, valor_hora, margem_pct = MARGEM_PADRAO):
     custo_tempo = horas * valor_hora
     custo_total = custo + custo_tempo
     margem_valor = custo_total * margem_pct
@@ -161,7 +250,7 @@ def calcular_preco(
 
 MOEDAS = {'pt': 'R$', 'en': '$', 'es': '€'}
 
-def formatar_resposta_preco(dados: dict, resultado: dict, lang: str = 'pt') -> str:
+def formatar_resposta_preco(dados, resultado, lang='pt'):
     moeda = MOEDAS.get(lang, 'R$')
     unidade = dados.get("unidade")
     ref = f" ({unidade})" if unidade else ""
@@ -176,7 +265,7 @@ def formatar_resposta_preco(dados: dict, resultado: dict, lang: str = 'pt') -> s
         f"Quer ver as outras opções (Agressivo e Valor Agregado)?"
     )
 
-def formatar_detalhes(resultado: dict, lang: str = 'pt') -> str:
+def formatar_detalhes(resultado, lang='pt'):
     moeda = MOEDAS.get(lang, 'R$')
     return (
         f"Aqui estão as 3 opções, em cima da mesma conta:\n\n"
@@ -187,7 +276,7 @@ def formatar_detalhes(resultado: dict, lang: str = 'pt') -> str:
     )
 
 # ============================================
-# PROMPT UNIVERSAL
+# PROMPT UNIVERSAL (precificação normal)
 # ============================================
 UNIVERSAL_PROMPT = {
     "pt": """Você é o Meu Caderninho, um assistente amigável que ajuda empreendedores a precificar seus produtos.
@@ -246,7 +335,7 @@ Respuesta: {"custo": 30, "horas": 2, "valor_hora": 20, "unidade": null, "margem_
 }
 
 # ============================================
-# CONSULTORIA (agora com teste A/B)
+# CONSULTORIA
 # ============================================
 CONSULTING_PROMPTS = {
     "pt": """Você é um consultor de negócios simpático e direto, focado em ajudar pequenos empreendedores a vender mais.
@@ -286,7 +375,6 @@ IMPORTANTE: NO menciones precios de la competencia, ya que no tienes datos reale
 No uses JSON, solo el texto final."""
 }
 
-# --- Fallback local para consultoria ---
 FALLBACK_CONSULTING = {
     "pt": "💡 *Dica rápida:* que tal oferecer um combo com outro produto relacionado? Por exemplo, {unidade} + bebida por um valor especial.\n\n"
           "📈 Lembre-se de revisar seu preço a cada 2 meses para acompanhar a inflação.\n\n"
@@ -351,14 +439,11 @@ async def chamar_groq_async(messages, headers, temperature=0):
         return response
 
 # ============================================
-# INFLAÇÃO (World Bank API – por país)
+# INFLAÇÃO
 # ============================================
 async def get_inflacao_pais(country_code: str) -> float:
-    """Retorna a inflação acumulada anual mais recente para o país (variação %)."""
     if country_code == "BRA":
-        # Mantém IPCA rápido para Brasil (Banco Central)
         return await get_ipca_mensal()
-    # Para outros, tenta World Bank
     url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/FP.CPI.TOTL.ZG?format=json&per_page=1&mrv=1"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -374,7 +459,6 @@ async def get_inflacao_pais(country_code: str) -> float:
     return 0.0
 
 async def get_ipca_mensal() -> float:
-    """Mantida para Brasil (IPCA mensal, Banco Central)."""
     url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.433/dados?formato=json"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -389,7 +473,7 @@ async def get_ipca_mensal() -> float:
 
 async def obter_inflacao_para_usuario(user_id: str) -> float:
     lang = user_language.get(user_id, 'pt')
-    country = IDIOMA_PAIS.get(lang, "USA")  # fallback
+    country = IDIOMA_PAIS.get(lang, "USA")
     return await get_inflacao_pais(country)
 
 # ============================================
@@ -411,12 +495,182 @@ async def salvar_historico(user_id, resultado, preco_final, custo_fixo, vendas, 
         "canal": canal
     }
     data[user_id]["historico"].append(entry)
-    # Mantém os últimos 50 registros
     data[user_id]["historico"] = data[user_id]["historico"][-50:]
     await save_user_data(data)
 
 # ============================================
-# COMANDOS
+# HANDLERS DE REVISÃO DE DOCUMENTOS
+# ============================================
+async def revisar_proposta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_state[user_id] = {"stage": "awaiting_document", "tipo": "proposta"}
+    await atualizar_dados_usuario(user_id, state=user_state[user_id])
+    await update.message.reply_text(
+        "📄 *Revisor de Propostas*\n\n"
+        "Envie o arquivo da proposta (PDF, Word, .txt ou .md) e eu vou analisar:\n"
+        "• Preço e margem\n"
+        "• Custos identificados\n"
+        "• Riscos\n"
+        "• Documentos faltantes\n"
+        "• Checklist final\n\n"
+        "Vamos começar! Envie o arquivo.",
+        parse_mode="Markdown"
+    )
+
+async def revisar_orcamento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_state[user_id] = {"stage": "awaiting_document", "tipo": "orcamento"}
+    await atualizar_dados_usuario(user_id, state=user_state[user_id])
+    await update.message.reply_text(
+        "📊 *Revisor de Orçamentos*\n\n"
+        "Envie o arquivo do orçamento (PDF, Word, .txt ou .md) e eu vou:\n"
+        "• Listar itens e valores\n"
+        "• Calcular custo total e margem\n"
+        "• Identificar itens superfaturados\n"
+        "• Sugerir ajustes\n\n"
+        "Envie o arquivo.",
+        parse_mode="Markdown"
+    )
+
+async def revisar_edital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_state[user_id] = {"stage": "awaiting_document", "tipo": "edital"}
+    await atualizar_dados_usuario(user_id, state=user_state[user_id])
+    await update.message.reply_text(
+        "📑 *Analisador de Editais*\n\n"
+        "Envie o edital (PDF, Word, .txt ou .md) e eu vou extrair:\n"
+        "• Objeto da licitação\n"
+        "• Valor estimado\n"
+        "• Prazos\n"
+        "• Exigências documentais\n"
+        "• Checklist completo\n"
+        "• Recomendação final\n\n"
+        "Envie o arquivo.",
+        parse_mode="Markdown"
+    )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    stage_data = user_state.get(user_id, {})
+    if stage_data.get("stage") != "awaiting_document":
+        return
+
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("Envie um arquivo PDF, Word, .txt ou .md.")
+        return
+
+    file_name = doc.file_name or ""
+    if not (file_name.lower().endswith('.pdf') or 
+            file_name.lower().endswith('.docx') or
+            file_name.lower().endswith('.txt') or
+            file_name.lower().endswith('.md')):
+        await update.message.reply_text("Formato não suportado. Envie PDF, .docx, .txt ou .md.")
+        return
+
+    try:
+        file = await doc.get_file()
+        file_path = os.path.join(DATA_DIR, f"{user_id}_{file_name}")
+        await file.download_to_drive(file_path)
+        logger.info(f"Arquivo baixado: {file_path}")
+    except Exception as e:
+        logger.error(f"Erro ao baixar arquivo: {e}")
+        await update.message.reply_text("Erro ao baixar o arquivo. Tente novamente.")
+        return
+
+    texto = extrair_texto_arquivo(file_path)
+    if not texto or len(texto.strip()) < 50:
+        await update.message.reply_text(
+            "Não consegui extrair texto suficiente do arquivo. "
+            "Verifique se o documento tem texto legível e tente novamente."
+        )
+        try: os.remove(file_path)
+        except: pass
+        return
+
+    tipo = stage_data.get("tipo", "proposta")
+    if tipo == "proposta":
+        prompt = PROMPT_REVISAO_PROPOSTA
+        titulo = "🔍 *Revisão da Proposta*"
+    elif tipo == "orcamento":
+        prompt = PROMPT_REVISAO_ORCAMENTO
+        titulo = "📊 *Análise do Orçamento*"
+    elif tipo == "edital":
+        prompt = PROMPT_REVISAO_EDITAL
+        titulo = "📑 *Análise do Edital*"
+    else:
+        prompt = PROMPT_REVISAO_PROPOSTA
+        titulo = "🔍 *Análise*"
+
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"Documento:\n\n{texto[:8000]}"}
+    ]
+
+    try:
+        headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+        response = await chamar_groq_async(messages, headers, temperature=0.3)
+        resposta = response.json()["choices"][0]["message"]["content"]
+        await update.message.reply_text(
+            f"{titulo}\n\n{resposta}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Erro na Groq: {e}")
+        await update.message.reply_text("Deu ruim na análise. Tenta de novo mais tarde.")
+    finally:
+        try: os.remove(file_path)
+        except: pass
+
+    user_state.pop(user_id, None)
+    await atualizar_dados_usuario(user_id, state=None)
+
+# ============================================
+# FUNÇÕES DE PRECIFICAÇÃO (fluxo normal)
+# ============================================
+async def iniciar_custos_fixos(update: Update, user_id: str, lang: str):
+    perguntas = {
+        'pt': "Agora vamos colocar os custos reais do seu negócio! 🏠\n"
+              "Você tem custos fixos mensais (luz, aluguel, internet, maquininha, transporte)?\n"
+              "Se sim, me diga o valor total por mês (ex: 300).",
+        'en': "Let's add your real business costs! 🏠\n"
+              "Do you have fixed monthly costs (electricity, rent, internet, card machine, delivery)?\n"
+              "If yes, tell me the total per month (e.g., 200).",
+        'es': "¡Agregemos tus costos reales! 🏠\n"
+              "¿Tienes costos fijos mensuales (luz, alquiler, internet, terminal de tarjeta, envío)?\n"
+              "Si es así, dime el total al mes (ej.: 200)."
+    }
+    pergunta = perguntas.get(lang, perguntas['pt'])
+    user_state[user_id]["stage"] = "awaiting_fixed_costs"
+    await atualizar_dados_usuario(user_id, state=user_state[user_id])
+    await update.message.reply_text(pergunta)
+
+async def gerar_consultoria(user_id: str, audiencia: str) -> str:
+    lang = user_language.get(user_id, 'pt')
+    moeda = MOEDAS.get(lang, 'R$')
+    dados = user_state[user_id]["dados"]
+    resultado = user_state[user_id]["resultado"]
+    unidade = dados.get("unidade", "seu produto/serviço")
+    preco_seguro = resultado["preco_seguro"]
+    prompt_template = CONSULTING_PROMPTS.get(lang, CONSULTING_PROMPTS['pt'])
+    system_prompt = prompt_template.format(unidade=unidade, moeda=moeda, preco_seguro=preco_seguro, audiencia=audiencia)
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Público: {audiencia}"}]
+    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    response = await chamar_groq_async(messages, headers, temperature=0.7)
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+FALLBACKS = {
+    'pt': "😅 *Poxa, estou com muitas pessoas usando o bot agora! Tenta de novo em alguns segundos.*",
+    'en': "😅 *Wow, I'm overwhelmed right now. Please try again in a few seconds.*",
+    'es': "😅 *¡Vaya, tengo mucha gente ahora! Intenta de nuevo en unos segundos.*"
+}
+
+def gerar_resposta_fallback(user_id: str) -> str:
+    lang = user_language.get(user_id, 'pt')
+    return FALLBACKS.get(lang, FALLBACKS['en'])
+
+# ============================================
+# COMANDOS BÁSICOS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -429,7 +683,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_histories[user_id] = []
     user_state.pop(user_id, None)
     await atualizar_dados_usuario(user_id, state=None)
-    await update.message.reply_text("Oi! Sou o Meu Caderninho. Me fala o que você quer precificar.")
+    await update.message.reply_text(
+        "Oi! Sou o Meu Caderninho.\n\n"
+        "Posso ajudar você a:\n"
+        "• Calcular preço justo (basta me dar custo, tempo e valor/hora)\n"
+        "• Revisar propostas (/revisar_proposta)\n"
+        "• Revisar orçamentos (/revisar_orcamento)\n"
+        "• Analisar editais (/revisar_edital)\n\n"
+        "Digite /ajuda para ver todos os comandos."
+    )
+
+async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📋 *Comandos disponíveis:*\n\n"
+        "/start - Iniciar o bot\n"
+        "/revisar_proposta - Revisar uma proposta comercial\n"
+        "/revisar_orcamento - Revisar um orçamento\n"
+        "/revisar_edital - Analisar um edital de licitação\n"
+        "/historico - Ver histórico de preços\n"
+        "/revisar - Comparar preços anteriores\n"
+        "/exportar - Exportar histórico em CSV\n"
+        "/alertas - Ativar/desativar alertas de inflação\n"
+        "/reajuste - Calcular reajuste por inflação\n"
+        "/admin - Estatísticas (apenas admin)\n\n"
+        "Para precificar, basta me dizer: custo, horas e valor/hora.",
+        parse_mode="Markdown"
+    )
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -472,7 +751,6 @@ async def revisar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lang = user_language.get(user_id, 'pt')
     moeda = MOEDAS.get(lang, 'R$')
-    # Últimos 5 (ou menos)
     ultimos = hist[-5:]
     reply = "📈 *Tendência de preços (últimos 5):*\n\n"
     for i in range(1, len(ultimos)):
@@ -490,14 +768,12 @@ async def exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not hist:
         await update.message.reply_text("Nenhum dado para exportar.")
         return
-    # Gera CSV em memória
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=["data", "produto", "preco_final", "custo_fixo_mensal", "vendas_mes", "canal"])
     writer.writeheader()
     for entry in hist:
         writer.writerow(entry)
     csv_bytes = output.getvalue().encode("utf-8")
-    # Envia como documento
     await update.message.reply_document(
         document=io.BytesIO(csv_bytes),
         filename="historico_precos.csv",
@@ -557,15 +833,20 @@ async def reajuste(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    
+    if update.message.document:
+        await handle_document(update, context)
+        return
+
     user_msg = update.message.text
     if not user_msg:
         return
 
     msg_lower = user_msg.strip().lower()
 
-    # --- SAUDAÇÕES ---
+    # Saudações
     saudacoes = {
-        "oi": "pt", "olá": "pt", "ola": "pt", "oie": "pt", "oiee": "pt", "e aí": "pt", "eai": "pt",
+        "oi": "pt", "olá": "pt", "ola": "pt", "oie": "pt", "e aí": "pt", "eai": "pt",
         "opa": "pt", "tudo bem": "pt", "bom dia": "pt", "boa tarde": "pt", "boa noite": "pt",
         "hi": "en", "hello": "en", "hey": "en", "good morning": "en", "good afternoon": "en",
         "good evening": "en", "how are you": "en", "what's up": "en", "yo": "en",
@@ -580,14 +861,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state.pop(user_id, None)
         boas_vindas = {
             "pt": "Oi! Sou o Meu Caderninho. Me fala o que você quer precificar.",
-            "en": "Hi! I'm Pricing Pal. Tell me what you want to price.",
-            "es": "¡Hola! Soy Mi Cuaderno. Dime qué quieres precificar.",
+            "en": "Hi! I'm Meu Caderninho. Tell me what you want to price.",
+            "es": "¡Hola! Soy Meu Caderninho. Dime qué quieres precificar.",
         }
         await update.message.reply_text(boas_vindas[lang])
         await atualizar_dados_usuario(user_id, language=lang, state=None)
         return
 
-    # --- IDIOMA PERSISTENTE ---
+    # Idioma
     if user_id not in user_language:
         try:
             detected = detect(user_msg)
@@ -609,12 +890,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = user_language[user_id]
     moeda = MOEDAS.get(lang, 'R$')
 
-    # --- ALERTA AUTOMÁTICO DE INFLAÇÃO (apenas se alertas ativados) ---
+    # Alerta automático
     data = await load_user_data()
     if data.get(user_id, {}).get("alerts_enabled") and data[user_id].get("historico"):
         ultimo_hist = data[user_id]["historico"][-1]
         ultima_data = datetime.fromisoformat(ultimo_hist["data"])
-        # Alerta se passaram mais de 30 dias e ainda não alertamos hoje
         if (datetime.now() - ultima_data > timedelta(days=30) and
             data[user_id].get("last_alert_date") != datetime.now().strftime("%Y-%m-%d")):
             inflacao = await obter_inflacao_para_usuario(user_id)
@@ -631,7 +911,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(alerta.get(lang, alerta['pt']), parse_mode="Markdown")
                 await atualizar_dados_usuario(user_id, last_alert_date=datetime.now().strftime("%Y-%m-%d"))
 
-    # --- ESTATÍSTICAS ---
+    # Estatísticas
     data = await load_user_data()
     if user_id not in data:
         data[user_id] = {"first_seen": datetime.now().isoformat()}
@@ -644,7 +924,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_histories[user_id] = []
     user_histories[user_id].append({"role": "user", "content": user_msg})
 
-    # --- CAPTURA DE NOME ---
+    # Captura de nome
     padroes_nome = [
         r'meu nome é\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)',
         r'chamo\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)',
@@ -682,7 +962,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
-    # --- ESTÁGIOS DE CONVERSA ---
+    # Estágios de conversa
     stage = user_state.get(user_id, {}).get("stage")
 
     if stage == "awaiting_audience":
@@ -690,7 +970,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             consulta = await gerar_consultoria(user_id, audiencia)
         except:
-            # Fallback local
             unidade = user_state[user_id].get("dados", {}).get("unidade", "seu produto")
             consulta = FALLBACK_CONSULTING.get(lang, FALLBACK_CONSULTING["pt"]).format(unidade=unidade)
         user_state[user_id]["stage"] = "consulting_done"
@@ -698,7 +977,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await atualizar_dados_usuario(user_id, state=user_state[user_id])
         return
 
-    # (restante dos estágios de custos fixos, vendas, canal mantidos iguais)
     if stage == "awaiting_fixed_costs":
         try:
             custo_fixo = float(user_msg.strip().replace(",", "."))
@@ -794,7 +1072,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await atualizar_dados_usuario(user_id, state=user_state[user_id])
         return
 
-    # --- ASSISTENTE UNIVERSAL (para qualquer outra mensagem) ---
+    # Assistente universal
     try:
         system_prompt = UNIVERSAL_PROMPT.get(lang, UNIVERSAL_PROMPT['pt'])
         messages = [
@@ -827,65 +1105,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # Resposta normal
     user_histories[user_id].append({"role": "assistant", "content": raw_reply})
     await update.message.reply_text(raw_reply, parse_mode="Markdown")
 
-async def iniciar_custos_fixos(update: Update, user_id: str, lang: str):
-    perguntas = {
-        'pt': "Agora vamos colocar os custos reais do seu negócio! 🏠\n"
-              "Você tem custos fixos mensais (luz, aluguel, internet, maquininha, transporte)?\n"
-              "Se sim, me diga o valor total por mês (ex: 300).",
-        'en': "Let's add your real business costs! 🏠\n"
-              "Do you have fixed monthly costs (electricity, rent, internet, card machine, delivery)?\n"
-              "If yes, tell me the total per month (e.g., 200).",
-        'es': "¡Agregemos tus costos reales! 🏠\n"
-              "¿Tienes costos fijos mensuales (luz, alquiler, internet, terminal de tarjeta, envío)?\n"
-              "Si es así, dime el total al mes (ej.: 200)."
-    }
-    pergunta = perguntas.get(lang, perguntas['pt'])
-    user_state[user_id]["stage"] = "awaiting_fixed_costs"
-    await atualizar_dados_usuario(user_id, state=user_state[user_id])
-    await update.message.reply_text(pergunta)
-
-async def gerar_consultoria(user_id: str, audiencia: str) -> str:
-    lang = user_language.get(user_id, 'pt')
-    moeda = MOEDAS.get(lang, 'R$')
-    dados = user_state[user_id]["dados"]
-    resultado = user_state[user_id]["resultado"]
-    unidade = dados.get("unidade", "seu produto/serviço")
-    preco_seguro = resultado["preco_seguro"]
-    prompt_template = CONSULTING_PROMPTS.get(lang, CONSULTING_PROMPTS['pt'])
-    system_prompt = prompt_template.format(unidade=unidade, moeda=moeda, preco_seguro=preco_seguro, audiencia=audiencia)
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Público: {audiencia}"}]
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    response = await chamar_groq_async(messages, headers, temperature=0.7)
-    return response.json()["choices"][0]["message"]["content"].strip()
-
-FALLBACKS = {
-    'pt': "😅 *Poxa, estou com muitas pessoas usando o bot agora!* ...",
-    'en': "😅 *Wow, I'm overwhelmed right now!* ...",
-    'es': "😅 *¡Vaya, tengo mucha gente ahora!* ..."
-}
-
-def gerar_resposta_fallback(user_id: str) -> str:
-    lang = user_language.get(user_id, 'pt')
-    return FALLBACKS.get(lang, FALLBACKS['en'])
-
 # ============================================
-# INICIALIZAÇÃO
+# MAIN
 # ============================================
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN não configurado nas variáveis de ambiente.")
+    
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ajuda", ajuda))
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("historico", historico))
     app.add_handler(CommandHandler("revisar", revisar))
     app.add_handler(CommandHandler("exportar", exportar))
     app.add_handler(CommandHandler("alertas", alertas))
     app.add_handler(CommandHandler("reajuste", reajuste))
+    
+    app.add_handler(CommandHandler("revisar_proposta", revisar_proposta))
+    app.add_handler(CommandHandler("revisar_orcamento", revisar_orcamento))
+    app.add_handler(CommandHandler("revisar_edital", revisar_edital))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
     print("Bot rodando 24/7 no Render...")
     app.run_polling(drop_pending_updates=True)
